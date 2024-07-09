@@ -3,3 +3,4 @@ pytest-cov
 
 # We also want everything as specified by setup.py
 -e .
+zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
