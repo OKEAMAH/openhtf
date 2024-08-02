@@ -14,16 +14,25 @@
 
 """Output and/or upload a TestRun or MfgEvent proto for mfg-inspector.com."""
 
+import functools
 import logging
 import time
 import zlib
 
+from google.auth import credentials as credentials_lib
 from google.auth.transport import requests
 from google.oauth2 import service_account
-
 from openhtf.output import callbacks
-from openhtf.output.proto import guzzle_pb2
 from openhtf.output.proto import test_runs_converter
+
+from openhtf.output.proto import test_runs_pb2
+from openhtf.output.proto import mfg_event_pb2
+from openhtf.output.proto import guzzle_pb2
+
+from typing import Any, Dict, Union
+
+
+_MFG_INSPECTOR_UPLOAD_TIMEOUT = 60 * 5
 
 
 class UploadFailedError(Exception):
@@ -34,20 +43,29 @@ class InvalidTestRunError(Exception):
   """Raised if test run is invalid."""
 
 
-def _send_mfg_inspector_request(envelope_data, credentials, destination_url):
+def _send_mfg_inspector_request(
+    envelope_data: bytes,
+    credentials: credentials_lib.Credentials,
+    destination_url: str,
+) -> Dict[str, Any]:
   """Send upload http request.  Intended to be run in retry loop."""
   logging.info('Uploading result...')
 
   with requests.AuthorizedSession(credentials) as authed_session:
     response = authed_session.request(
-        'POST', destination_url, data=envelope_data)
+        'POST',
+        destination_url,
+        data=envelope_data,
+        timeout=_MFG_INSPECTOR_UPLOAD_TIMEOUT,
+    )
 
   try:
     result = response.json()
-  except Exception:
-    logging.warning('Upload failed with response %s: %s', response,
-                    response.text)
-    raise UploadFailedError(response, response.text)
+  except Exception as e:
+    logging.exception(
+        'Upload failed with response %s: %s', response, response.text
+    )
+    raise UploadFailedError(response, response.text) from e
 
   if response.status_code == 200:
     return result
@@ -60,18 +78,38 @@ def _send_mfg_inspector_request(envelope_data, credentials, destination_url):
     raise UploadFailedError(message)
 
 
-def send_mfg_inspector_data(inspector_proto, credentials, destination_url,
-                            payload_type):
+@functools.lru_cache(len(guzzle_pb2.PayloadType.values()))
+def _is_compressed_payload_type(
+    payload_type: guzzle_pb2.PayloadType,
+) -> bool:
+  return (
+      guzzle_pb2.PayloadType.Name(payload_type)
+      .lower()
+      .startswith('compressed_')
+  )
+
+
+def send_mfg_inspector_data(
+    inspector_proto: Union[mfg_event_pb2.MfgEvent, test_runs_pb2.TestRun],
+    credentials: credentials_lib.Credentials,
+    destination_url: str,
+    payload_type: guzzle_pb2.PayloadType,
+) -> Dict[str, Any]:
   """Upload MfgEvent to steam_engine."""
   envelope = guzzle_pb2.TestRunEnvelope()  # pytype: disable=module-attr  # gen-stub-imports
-  envelope.payload = zlib.compress(inspector_proto.SerializeToString())
+  data = inspector_proto.SerializeToString()
+  if _is_compressed_payload_type(payload_type):
+    data = zlib.compress(data)
+
+  envelope.payload = data
   envelope.payload_type = payload_type
   envelope_data = envelope.SerializeToString()
 
   for _ in range(5):
     try:
-      result = _send_mfg_inspector_request(envelope_data, credentials,
-                                           destination_url)
+      result = _send_mfg_inspector_request(
+          envelope_data, credentials, destination_url
+      )
       return result
     except UploadFailedError:
       time.sleep(1)
